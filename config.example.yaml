@@ -7,6 +7,16 @@ power_off_cmd: "shutdown -h now"   # 例: "systemctl poweroff" でも可
 node_shutdown_timeout: 600   # 秒
 poll_interval: 5             # 秒
 
+# 接続/診断タイムアウト設定（任意）
+# 無ければスクリプト内の既定値を使用
+timeouts:
+  connect: 15         # SSH接続タイムアウト（秒）
+  banner: 15          # SSHバナー受信タイムアウト（秒）
+  auth: 15            # 認証タイムアウト（秒）
+  channel_open: 10    # direct-tcpip チャネル確立のタイムアウト（秒）
+  diag_cmd: 8         # 診断コマンド実行タイムアウト（秒）
+  nc: 3               # nc の -w 秒数
+
 # triton (ゲート) 設定
 gateway:
   host: "triton"
