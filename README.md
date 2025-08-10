@@ -2,6 +2,8 @@
 
 [Rich](https://github.com/Textualize/rich) を利用した、モダンなターミナルUIを備えた多段ホップSSHシャットダウン自動化ツールです。
 
+<img src="./test.png" width=80%>
+
 ## 特徴
 
 * **多段ホップSSH**: ゲートサーバー（例: `triton`）に接続し、そこから各ワークステーションと配下ノードへジャンプして安全にシャットダウン。
