@@ -1,0 +1,40 @@
+# shutdown-bot 設定 (YAML)
+
+# 停止コマンド（環境に合わせて変更可）
+power_off_cmd: "shutdown -h now"   # 例: "systemctl poweroff" でも可
+
+# ノード停止確認の待機設定
+node_shutdown_timeout: 600   # 秒
+poll_interval: 5             # 秒
+
+# triton (ゲート) 設定
+gateway:
+  host: "triton"
+  user: "YOUR_GATEWAY_USER"
+  pkey_path: "~/.ssh/id_ed25519"
+  port: 22
+  needs_sudo_password: false   # triton停止にsudoが必要なら true
+  sudo_user: null
+
+# 各workstation（配下にノードを持つ場合と、単体サーバーの両方に対応）
+fleets:
+  - name: "orion"
+    user: "YOUR_WS_USER"
+    password: null            # null=起動時にプロンプト / "env:VAR"=環境変数 / 文字列=平文(非推奨)
+    nodes: ["orion01","orion02","orion03"]
+    port: 22
+    needs_sudo_password: true
+
+  - name: "virgo"
+    user: "YOUR_WS_USER"
+    password: null
+    nodes: ["virgo01","virgo02","virgo03"]
+    port: 22
+    needs_sudo_password: true
+
+  - name: "spica"             # 単体サーバー例（ノードなし）
+    user: "YOUR_WS_USER"
+    password: null
+    nodes: []
+    port: 22
+    needs_sudo_password: true
