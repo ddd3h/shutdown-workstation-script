@@ -1,5 +1,4 @@
-
-# SSH Shutdown Bot (Modern UI)
+# SSH Shutdown Bot
 
 [Rich](https://github.com/Textualize/rich) を利用した、モダンなターミナルUIを備えた多段ホップSSHシャットダウン自動化ツールです。
 
