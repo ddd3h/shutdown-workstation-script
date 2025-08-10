@@ -4,3 +4,4 @@ logs/
 venv/
 *.spec
 .DS_Store
+config.yaml
