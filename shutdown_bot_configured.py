@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
 """
 SSH Shutdown Bot (config-driven)
 ================================
@@ -36,7 +39,6 @@ _sys.stdout = _Tee(_sys.stdout, _log_fh)
 _sys.stderr = _Tee(_sys.stderr, _log_fh)
 print(f"[LOG] 出力を保存します: {_log_path}")
 
-from __future__ import annotations
 import argparse
 import getpass
 import socket
