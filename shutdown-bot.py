@@ -4,15 +4,16 @@
 from __future__ import annotations
 
 """
-SSH Shutdown Bot (config-driven, modern UI)
-==========================================
-- YAML config, multi-hop SSH (Paramiko)
-- Wait-for-node-down protection
-- Auto logging (Tee to ./logs/)
-- Optional modern TUI with Rich: progress bars, tables, status spinners
+SSH Shutdown Bot (modern UI + diagnostics + configurable timeouts)
+==================================================================
+- Rich UI: table/progress/status（--no-rich で無効化可）
+- 実接続（--dry-run でも接続は行い、shutdownコマンドだけスキップ）
+- 到達不能時はそのホップ上で DNS/TCP 診断を実施し、原因を分類して提示
+- タイムアウト（SSH接続/チャネル/診断など）は config.yaml の timeouts セクションから設定可能
+- ログは ./logs/shutdown_YYYYmmdd_HHMMSS.log に保存（stdout/stderr を Tee）
 """
 
-# ---- ログ保存 (実行ごとにファイル作成) ----
+# ---- ログ保存 ----
 import sys as _sys, os as _os
 from datetime import datetime as _dt
 try:
@@ -46,17 +47,20 @@ import getpass
 import socket
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any, Tuple
 
 import os
 import paramiko
+from paramiko.ssh_exception import (
+    SSHException, AuthenticationException, BadHostKeyException, ChannelException,
+)
 try:
     import yaml  # PyYAML
 except Exception as e:
     print("[注意] PyYAML が見つかりません。`pip install pyyaml` を実行してください。", file=_sys.stderr)
     raise
 
-# Rich は任意（未インストールならプレーン出力）
+# Rich (任意、未導入ならプレーン表示)
 _HAS_RICH = True
 try:
     from rich.console import Console
@@ -89,12 +93,20 @@ class Fleet:
     port: int = 22
     needs_sudo_password: bool = True
 
-# 実行する停止コマンド（環境に合わせて変更可／configでも上書き可）
+# =========================
+# 既定値（config.yamlで上書き可）
+# =========================
 POWER_OFF_CMD = "shutdown -h now"
-
-# 親を止める前に子ノードのダウンを確認するためのデフォルト値（configでも上書き可）
 DEFAULT_NODE_SHUTDOWN_TIMEOUT = 600   # 秒
 DEFAULT_POLL_INTERVAL = 5             # 秒
+
+# 接続/診断タイムアウト（configの timeouts で上書き可）
+CONNECT_TIMEOUT = 15        # Paramiko connect() timeout
+BANNER_TIMEOUT = 15         # Paramiko banner_timeout
+AUTH_TIMEOUT = 15           # Paramiko auth_timeout
+CHANNEL_OPEN_TIMEOUT = 10   # direct-tcpip open timeout
+DIAG_CMD_TIMEOUT = 10       # リモート診断コマンド timeout
+NC_TIMEOUT = 3              # nc の -w 秒数
 
 # =========================
 # SSHユーティリティ
@@ -141,15 +153,18 @@ def connect_host(host: str, user: str, port: int = 22, *,
         sock=sock,
         allow_agent=True,
         look_for_keys=True,
-        timeout=20,
+        timeout=CONNECT_TIMEOUT,
+        banner_timeout=BANNER_TIMEOUT,
+        auth_timeout=AUTH_TIMEOUT,
     )
     return SSH(cli, cli.get_transport())
 
-def open_direct_tcpip_channel(transport: paramiko.Transport, dest_host: str, dest_port: int) -> socket.socket:
+def open_direct_tcpip_channel(transport: paramiko.Transport, dest_host: str, dest_port: int):
     return transport.open_channel(
         kind="direct-tcpip",
         dest_addr=(dest_host, dest_port),
         src_addr=("127.0.0.1", 0),
+        timeout=CHANNEL_OPEN_TIMEOUT,
     )
 
 def is_ssh_reachable_via_transport(transport: paramiko.Transport, host: str, port: int, *, timeout: float = 5.0) -> bool:
@@ -186,7 +201,7 @@ def wait_for_host_down_via_transport(transport: paramiko.Transport, host: str, p
                 return True
             time.sleep(interval)
         if console:
-            console.log(f"[yellow]Timeout[/yellow]: {host} still reachable") 
+            console.log(f"[yellow]Timeout[/yellow]: {host} still reachable")
         else:
             print(f"    タイムアウト: {host} はまだ到達可能です")
         return False
@@ -194,6 +209,78 @@ def wait_for_host_down_via_transport(transport: paramiko.Transport, host: str, p
         if console:
             status.stop()
 
+# =========================
+# 診断ヘルパー
+# =========================
+def _run(ws_client: paramiko.SSHClient, cmd: str, timeout: int = DIAG_CMD_TIMEOUT) -> Tuple[int, str, str]:
+    stdin, stdout, stderr = ws_client.exec_command(cmd, get_pty=False, timeout=timeout)
+    rc = stdout.channel.recv_exit_status()
+    out = stdout.read().decode(errors="ignore")
+    err = stderr.read().decode(errors="ignore")
+    return rc, out, err
+
+def diagnose_on_remote(ws_client: paramiko.SSHClient, target_host: str, port: int = 22) -> Dict[str, Any]:
+    """Workstation側で名前解決とTCP疎通を診断する。"""
+    result: Dict[str, Any] = {"dns_ok": None, "dns_ips": [], "tcp_ok": None, "tcp_method": None, "notes": []}
+    # DNS: getent hosts / getent ahosts / nslookup fallback
+    cmds = [
+        f"getent hosts {target_host}",
+        f"getent ahosts {target_host}",
+        # f-string では { } を {{ }} にエスケープ
+        f"nslookup {target_host} 2>/dev/null | awk '/^Address[[:space:]]*:/{{print $2}}'",
+    ]
+    for cmd in cmds:
+        rc, out, err = _run(ws_client, cmd)
+        if out.strip():
+            ips = []
+            for line in out.splitlines():
+                parts = line.strip().split()
+                for tok in parts:
+                    if tok.replace('.', '').isdigit() or ':' in tok:
+                        ips.append(tok)
+            if ips:
+                result["dns_ok"] = True
+                result["dns_ips"] = list(dict.fromkeys(ips))  # unique
+                break
+    if result["dns_ok"] is None:
+        result["dns_ok"] = False
+        result["notes"].append("DNS解決に失敗（workstation側）")
+    # TCP: nc or /dev/tcp
+    rc, out, err = _run(ws_client, f"command -v nc >/dev/null 2>&1 && nc -zw{NC_TIMEOUT} {target_host} {port} && echo OK || echo NG")
+    if "OK" in out:
+        result["tcp_ok"] = True
+        result["tcp_method"] = "nc"
+    else:
+        # bash /dev/tcp
+        rc, out, err = _run(ws_client, f"bash -lc 'exec 3<>/dev/tcp/{target_host}/{port} && echo OK || echo NG'")
+        if "OK" in out:
+            result["tcp_ok"] = True
+            result["tcp_method"] = "/dev/tcp"
+        else:
+            result["tcp_ok"] = False
+            result["tcp_method"] = "nc|/dev/tcp"
+    return result
+
+def classify_failure(exc: Exception, diag: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """Return (reason, hint)."""
+    if isinstance(exc, AuthenticationException):
+        return ("認証失敗", "ユーザー名/パスワード（または鍵）を確認してください")
+    if isinstance(exc, BadHostKeyException):
+        return ("ホスト鍵不一致", "known_hostsの該当エントリ削除や鍵の更新を検討してください")
+    if isinstance(exc, ChannelException):
+        if diag:
+            if diag.get("dns_ok") is False:
+                return ("名前解決失敗", "DNSや /etc/hosts の設定を見直してください（workstation側）")
+            if diag.get("tcp_ok") is False:
+                return ("TCP到達不可", "FW/ルーティング/ポート閉塞の可能性（workstation→対象:22）")
+        return ("チャネル接続失敗", "対象ホストがダウン/到達不能の可能性")
+    if isinstance(exc, SSHException):
+        return ("SSH例外", "ネットワークやSSH設定を確認してください")
+    return ("不明エラー", str(exc))
+
+# =========================
+# リモートコマンド
+# =========================
 def run_remote_command(client: paramiko.SSHClient, command: str, *,
                        sudo: bool = False,
                        sudo_password: Optional[str] = None,
@@ -221,7 +308,6 @@ def shutdown_host(tag: str, client: paramiko.SSHClient, *,
                   sudo_password: Optional[str],
                   dry_run: bool,
                   console: Optional[Console] = None) -> None:
-    global POWER_OFF_CMD
     cmd = POWER_OFF_CMD
     (console.log(f"→ {tag}: {cmd}") if console else print(f"→ {tag}: {cmd}"))
     if dry_run:
@@ -237,22 +323,39 @@ def shutdown_host(tag: str, client: paramiko.SSHClient, *,
 def _resolve_password(value: Optional[str], prompt_label: str) -> Optional[str]:
     if value is None:
         return getpass.getpass(prompt_label)
-    if isinstance(value, str) and value.startswith("env:"):
-        env_key = value.split(":", 1)[1]
-        v = os.environ.get(env_key)
-        if v is None:
-            raise RuntimeError(f"環境変数 {env_key} が未設定です（{prompt_label}）")
-        return v
+    if isinstance(value, str):
+        if value.startswith("env:"):
+            env_key = value.split(":", 1)[1]
+            v = os.environ.get(env_key)
+            if v is None:
+                raise RuntimeError(f"環境変数 {env_key} が未設定です（{prompt_label}）")
+            return v
+        if value.startswith("file:"):
+            path = value.split(":", 1)[1]
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
     return value
 
 def load_config(path: str):
     global POWER_OFF_CMD, DEFAULT_NODE_SHUTDOWN_TIMEOUT, DEFAULT_POLL_INTERVAL
+    global CONNECT_TIMEOUT, BANNER_TIMEOUT, AUTH_TIMEOUT, CHANNEL_OPEN_TIMEOUT, DIAG_CMD_TIMEOUT, NC_TIMEOUT
+
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    # poweroff cmd / wait パラメータ
+
+    # poweroff/wait
     POWER_OFF_CMD = cfg.get("power_off_cmd", POWER_OFF_CMD)
     DEFAULT_NODE_SHUTDOWN_TIMEOUT = int(cfg.get("node_shutdown_timeout", DEFAULT_NODE_SHUTDOWN_TIMEOUT))
     DEFAULT_POLL_INTERVAL = int(cfg.get("poll_interval", DEFAULT_POLL_INTERVAL))
+
+    # timeouts セクション（任意）
+    tmo = cfg.get("timeouts", {}) or {}
+    CONNECT_TIMEOUT       = int(tmo.get("connect", CONNECT_TIMEOUT))
+    BANNER_TIMEOUT        = int(tmo.get("banner",  BANNER_TIMEOUT))
+    AUTH_TIMEOUT          = int(tmo.get("auth",    AUTH_TIMEOUT))
+    CHANNEL_OPEN_TIMEOUT  = int(tmo.get("channel_open", CHANNEL_OPEN_TIMEOUT))
+    DIAG_CMD_TIMEOUT      = int(tmo.get("diag_cmd", DIAG_CMD_TIMEOUT))
+    NC_TIMEOUT            = int(tmo.get("nc", NC_TIMEOUT))
 
     gw_raw = cfg.get("gateway") or {}
     gw = Gateway(
@@ -279,9 +382,9 @@ def load_config(path: str):
 # メイン
 # =========================
 def main():
-    ap = argparse.ArgumentParser(description="多段ホップでノード→親→…→tritonを順停止（YAML設定版, Rich対応）")
+    ap = argparse.ArgumentParser(description="多段ホップでノード→親→…→tritonを順停止（Rich対応・診断付き）")
     ap.add_argument("--config", "-c", required=True, help="設定ファイル（YAML）へのパス")
-    ap.add_argument("--dry-run", action="store_true", help="コマンドを表示するだけで実行しない")
+    ap.add_argument("--dry-run", action="store_true", help="停止コマンドは実行しない（接続は行う）")
     ap.add_argument("--node-timeout", type=int, default=None, help="各ノードの停止待ちタイムアウト(秒)（設定の上書き）")
     ap.add_argument("--poll-interval", type=int, default=None, help="到達性チェックの間隔(秒)（設定の上書き）")
     ap.add_argument("--non-strict", action="store_true", help="ノードの完全停止が確認できなくても親を停止する")
@@ -289,7 +392,6 @@ def main():
     ap.add_argument("--no-color-log", action="store_true", help="ログファイルにカラーコードを出さない")
     args = ap.parse_args()
 
-    # Rich setup
     console: Optional[Console] = None
     use_rich = _HAS_RICH and (not args.no_rich)
     if use_rich:
@@ -308,12 +410,12 @@ def main():
     if gw.needs_sudo_password:
         gw_sudo_pw = getpass.getpass("[triton] のsudoパスワード: ")
 
-    # 対象一覧を表示（Rich Table）
+    # 対象一覧
     if console:
         table = Table(title="Targets", show_lines=False)
         table.add_column("Workstation", style="bold")
         table.add_column("User")
-        table.add_column("Nodes") 
+        table.add_column("Nodes")
         for f in fleets:
             nodes_s = ",".join(f.nodes) if f.nodes else "(単体)"
             table.add_row(f.name, f.user, nodes_s)
@@ -325,24 +427,24 @@ def main():
             print(f"- {f.name}: nodes={nodes_s} (user={f.user})")
         print("最後に triton を停止します。\n")
 
-    if not args.dry_run:
-        confirm = input("本当にシャットダウンしますか？ (YESと入力): ")
-        if confirm.strip() != "YES":
-            print("中止しました。")
-            return
-
-    # 1) tritonへ鍵で接続
+    # 1) triton接続
     if console: console.log("[bold]Connecting to triton…[/bold]")
     else: print("\n[1] triton に接続中…")
     pkey = load_pkey(gw.pkey_path)
-    gw_conn = connect_host(gw.host, gw.user, gw.port, pkey=pkey)
+    try:
+        gw_conn = connect_host(gw.host, gw.user, gw.port, pkey=pkey)
+    except Exception as e:
+        reason, hint = classify_failure(e, None)
+        msg = f"[致命的] triton 接続失敗: {reason} — {hint} — 詳細: {e}"
+        (console.log(f"[red]{msg}[/red]") if console else print(msg))
+        return
     if console: console.log("[green]Connected[/green]: triton OK")
     else: print("接続: triton OK")
 
-    # プログレスバー準備
-    total_steps = 1  # 最後の triton 停止
+    # プログレス
+    total_steps = 1
     for f in fleets:
-        total_steps += len(f.nodes) + 1  # 各ノード + 親
+        total_steps += len(f.nodes) + 1
     progress_ctx = None
     if console:
         progress = Progress(
@@ -360,20 +462,33 @@ def main():
     else:
         progress = None
         task_id = None
-
     def step_advance(n=1):
         if progress_ctx is not None and task_id is not None:
             progress_ctx.update(task_id, advance=n)
 
+    issues: List[Dict[str, Any]] = []
+
     try:
         if progress_ctx: progress_ctx.start()
-        # 2) 各workstationを順に処理
+        # 各workstation
         for f in fleets:
             pw = fleet_pw_map[f.name]
             if console: console.log(f"[bold]Hop to {f.name}[/bold]")
             else: print(f"\n[2] {f.name} にジャンプ…")
-            sock_ws = open_direct_tcpip_channel(gw_conn.transport, f.name, f.port)
-            ws = connect_host(f.name, f.user, f.port, password=pw, sock=sock_ws)
+            try:
+                sock_ws = open_direct_tcpip_channel(gw_conn.transport, f.name, f.port)
+                ws = connect_host(f.name, f.user, f.port, password=pw, sock=sock_ws)
+            except Exception as e:
+                # 診断: triton上で f.name を解決/疎通
+                diag = diagnose_on_remote(gw_conn.client, f.name, f.port)
+                reason, hint = classify_failure(e, diag)
+                issue = {"stage": "workstation", "via": "triton", "target": f.name,
+                         "reason": reason, "hint": hint, "diag": diag, "error": str(e)}
+                issues.append(issue)
+                (console.log(f"[red]WS接続失敗[/red]: {issue}") if console else print(f"WS接続失敗: {issue}"))
+                # workstationに入れないので子はスキップ
+                step_advance(len(f.nodes) + 1)
+                continue
             if console: console.log(f"[green]Connected[/green]: {f.name} OK")
             else: print(f"接続: {f.name} OK")
             try:
@@ -381,8 +496,27 @@ def main():
                 for node in f.nodes:
                     if console: console.log(f"→ {f.name} 経由で [bold]{node}[/bold] へ…")
                     else: print(f"  -> {f.name} 経由で {node} にジャンプ…")
-                    sock_node = open_direct_tcpip_channel(ws.transport, node, f.port)
-                    node_cli = connect_host(node, f.user, f.port, password=pw, sock=sock_node)
+                    try:
+                        # 予備診断（DNS/TCP）
+                        pre = diagnose_on_remote(ws.client, node, f.port)
+                        if pre["dns_ok"] is False or pre["tcp_ok"] is False:
+                            reason = "名前解決失敗" if pre["dns_ok"] is False else "TCP到達不可"
+                            hint = "DNSや /etc/hosts を確認" if pre["dns_ok"] is False else "FW/ルーティング/ポートを確認"
+                            issues.append({"stage": "node(precheck)", "via": f.name, "target": node,
+                                           "reason": reason, "hint": hint, "diag": pre, "error": ""})
+                            (console.log(f"[yellow]Precheck警告[/yellow] {node}: {reason}") if console else print(f"[警告] {node}: {reason}"))
+                        sock_node = open_direct_tcpip_channel(ws.transport, node, f.port)
+                        node_cli = connect_host(node, f.user, f.port, password=pw, sock=sock_node)
+                    except Exception as e:
+                        diag = diagnose_on_remote(ws.client, node, f.port)
+                        reason, hint = classify_failure(e, diag)
+                        issues.append({"stage": "node", "via": f.name, "target": node,
+                                       "reason": reason, "hint": hint, "diag": diag, "error": str(e)})
+                        (console.log(f"[red]Node接続失敗[/red]: {node} — {reason}: {hint}") if console else print(f"[エラー] {node} 接続失敗: {reason} — {hint} — {e}"))
+                        if not args.dry_run and not args.non_strict:
+                            parent_skip = True
+                        step_advance(1)
+                        continue
                     try:
                         shutdown_host(node, node_cli.client,
                                       needs_sudo_password=f.needs_sudo_password,
@@ -403,7 +537,7 @@ def main():
                         step_advance(1)
                         time.sleep(0.2)
 
-                # 親workstationを停止
+                # 親停止
                 if parent_skip:
                     (console.log(f"[yellow][保護] {f.name} の停止はスキップされました（子ノード未停止の可能性）。[/yellow]") if console else print(f"[保護] {f.name} の停止はスキップされました（子ノード未停止の可能性）。"))
                 else:
@@ -417,7 +551,7 @@ def main():
                 ws.close()
                 time.sleep(0.2)
 
-        # 3) 最後に triton を停止
+        # triton停止
         if console: console.log("[bold]Shutting down triton…[/bold]")
         else: print("\n[3] triton を停止…")
         shutdown_host("triton", gw_conn.client,
@@ -430,6 +564,31 @@ def main():
     finally:
         if progress_ctx: progress_ctx.stop()
         gw_conn.close()
+        # 診断レポート
+        if issues:
+            if console:
+                t = Table(title="Diagnostics", show_lines=False)
+                t.add_column("Stage")
+                t.add_column("Via")
+                t.add_column("Target", style="bold")
+                t.add_column("Reason")
+                t.add_column("Hint")
+                t.add_column("Details")
+                for it in issues:
+                    details = ""
+                    d = it.get("diag") or {}
+                    if "dns_ok" in d:
+                        details += f"DNS={d['dns_ok']}"
+                        if d.get("dns_ips"): details += f" ips={','.join(d['dns_ips'])}"
+                        details += " "
+                    if "tcp_ok" in d:
+                        details += f"TCP22={d['tcp_ok']}({d.get('tcp_method')})"
+                    t.add_row(it["stage"], str(it.get("via","")), it["target"], it["reason"], it["hint"], details or it.get("error",""))
+                console.print(t)
+            else:
+                print("\n[Diagnostics] 接続失敗や警告の概要:")
+                for it in issues:
+                    print(f"- {it['stage']} via {it.get('via','')}: {it['target']} — {it['reason']} | {it['hint']} | {it.get('diag') or it.get('error','')}")
         (console.log("[green]完了。[/green]") if console else print("完了。"))
 
 if __name__ == "__main__":
