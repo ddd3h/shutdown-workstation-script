@@ -485,7 +485,7 @@ def main():
                 issue = {"stage": "workstation", "via": "triton", "target": f.name,
                          "reason": reason, "hint": hint, "diag": diag, "error": str(e)}
                 issues.append(issue)
-                (console.log(f"[red]WS接続失敗[/red]: {issue}") if console else print(f"WS接続失敗: {issue}"))
+                (console.log(f"[red]WS接続失敗[/red]: {reason}") if console else print(f"WS接続失敗: {reason}"))
                 # workstationに入れないので子はスキップ
                 step_advance(len(f.nodes) + 1)
                 continue
@@ -590,6 +590,42 @@ def main():
                 for it in issues:
                     print(f"- {it['stage']} via {it.get('via','')}: {it['target']} — {it['reason']} | {it['hint']} | {it.get('diag') or it.get('error','')}")
         (console.log("[green]完了。[/green]") if console else print("完了。"))
+
+def _summarize_diag(diag: Optional[Dict[str, Any]]) -> str:
+    if not diag:
+        return ""
+    parts = []
+    if "dns_ok" in diag:
+        s = f"DNS={diag['dns_ok']}"
+        if diag.get("dns_ips"):
+            s += f" ips={','.join(diag['dns_ips'])}"
+        parts.append(s)
+    if "tcp_ok" in diag:
+        parts.append(f"TCP22={diag['tcp_ok']}({diag.get('tcp_method')})")
+    return " ".join(parts)
+
+def _log_issue_line(prefix: str, issue: Dict[str, Any], console: Optional[Console]):
+    stage  = issue.get("stage", "")
+    via    = issue.get("via", "")
+    target = issue.get("target", "")
+    reason = issue.get("reason", "")
+    hint   = issue.get("hint", "")
+    diag   = issue.get("diag", {})
+    error  = issue.get("error", "")
+
+    diag_s = _summarize_diag(diag)
+    line = (
+        f"{prefix}: stage={stage} via={via} target={target} "
+        f"reason={reason} hint={hint} "
+        f"{('diag=[' + diag_s + '] ') if diag_s else ''}"
+        f"{('error=' + error) if error else ''}"
+    )
+    if console:
+        # 色は最小限で。prefixで色分け
+        color = "red" if "失敗" in prefix else ("yellow" if "警告" in prefix else "white")
+        console.log(f"[{color}]{line}[/{color}]")
+    else:
+        print(line)
 
 if __name__ == "__main__":
     main()
