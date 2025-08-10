@@ -62,13 +62,20 @@ fleets:
     nodes: []
     port: 22
     needs_sudo_password: true
+
+  - name: procyon
+    user: procyon_user
+    password: "file:./my.pass"
+    nodes: []
+    port: 22
+    needs_sudo_password: true
 ```
 
 
 ## 使い方
 
 ```bash
-python shutdown_bot_modern.py --config ./config.yaml
+python shutdown-bot.py --config ./config.yaml
 ```
 
 ### オプション
@@ -88,19 +95,19 @@ python shutdown_bot_modern.py --config ./config.yaml
 シャットダウン手順を事前確認:
 
 ```bash
-python shutdown_bot_modern.py -c config.yaml --dry-run
+python shutdown-bot.py -c config.yaml --dry-run
 ```
 
 Rich UI付きで実行:
 
 ```bash
-python shutdown_bot_modern.py -c config.yaml
+python shutdown-bot.py -c config.yaml
 ```
 
 プレーン出力モード:
 
 ```bash
-python shutdown_bot_modern.py -c config.yaml --no-rich
+python shutdown-bot.py -c config.yaml --no-rich
 ```
 
 
@@ -114,7 +121,7 @@ pyinstaller --onefile \
   --collect-all paramiko \
   --collect-all cryptography \
   --collect-all rich \
-  shutdown_bot_modern.py
+  shutdown-bot.py
 ```
 
 生成されたバイナリは `dist/shutdown-bot` に出力されます。
@@ -122,19 +129,19 @@ pyinstaller --onefile \
 
 ## スクリプトを使用してバイナリ化する場合
 
-#### 1. Modern版（`shutdown_bot_modern.py`）をバイナリ化する場合
+#### 1. Modern版（`shutdown-bot.py`）をバイナリ化する場合
 
 ```bash
-./build_binary.sh
+./build-binary.sh
 ```
 
-* 引数を省略すると、スクリプト内のデフォルト（`shutdown_bot_modern.py`）をビルドします。
+* 引数を省略すると、スクリプト内のデフォルト（`shutdown-bot.py`）をビルドします。
 * 成功すると `dist/shutdown-bot` が生成されます。
 
 #### 2. 別のスクリプトを指定してビルドする場合
 
 ```bash
-./build_binary.sh shutdown_bot_configured.py
+./build-binary.sh shutdown_bot_configured.py
 ```
 
 * 引数にファイル名を渡せば、そのスクリプトをビルドします。
@@ -149,6 +156,6 @@ pyinstaller --onefile \
 * macOS / Linuxではスクリプトに実行権限が必要です：
 
   ```bash
-  chmod +x build_binary.sh
+  chmod +x build-binary.sh
   ```
 * 出力されたバイナリは、依存ライブラリを含む**単一実行ファイル**です。

@@ -20,14 +20,14 @@ gateway:
 fleets:
   - name: "orion"
     user: "YOUR_WS_USER"
-    password: null            # null=起動時にプロンプト / "env:VAR"=環境変数 / 文字列=平文(非推奨)
+    password: null            # null=起動時にプロンプト / "env:VAR"=環境変数 / 文字列=平文(非推奨) / "file:./my.pass"=ファイルから読み込み
     nodes: ["orion01","orion02","orion03"]
     port: 22
     needs_sudo_password: true
 
   - name: "virgo"
     user: "YOUR_WS_USER"
-    password: null
+    password: "env:ORION_PW" # 環境変数から読み込む
     nodes: ["virgo01","virgo02","virgo03"]
     port: 22
     needs_sudo_password: true
@@ -35,6 +35,13 @@ fleets:
   - name: "spica"             # 単体サーバー例（ノードなし）
     user: "YOUR_WS_USER"
     password: null
+    nodes: []
+    port: 22
+    needs_sudo_password: true
+
+  - name: procyon
+    user: "YOUR_WS_USER"
+    password: "file:./my.pass" #.passファイルにパスワードを保存して参照させることも可能
     nodes: []
     port: 22
     needs_sudo_password: true
