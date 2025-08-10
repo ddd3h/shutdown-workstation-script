@@ -1,91 +1,153 @@
 
-# SSH多段ホップ停止ボット
+# SSH Shutdown Bot (Modern UI)
 
-このツールは、**triton**（ゲートサーバー）にSSHで接続し、そこから各workstation（例: orion, virgo, spicaなど）とその配下ノードを順にシャットダウンし、最後にtritonを停止します。  
-設定は外部のYAMLファイルに切り出して管理でき、PyInstallerで単一バイナリにビルド可能です。
+[Rich](https://github.com/Textualize/rich) を利用した、モダンなターミナルUIを備えた多段ホップSSHシャットダウン自動化ツールです。
 
 ## 特徴
-- **多段ホップSSH**（Paramiko + direct-tcpip）
-- tritonは鍵認証、下流はパスワード認証（sudo対応）
-- ノード停止後、**SSH到達性の消失を確認**してから親停止
-- `--dry-run` で安全に動作確認
-- 実行ログを `./logs/` に自動保存（標準出力/標準エラーをTee）
-- 設定をYAMLファイルに分離（パスワードは環境変数や起動時入力可）
-- PyInstallerで単一バイナリ化可能
 
-## 必要要件
-- Python 3.9+
-- pipインストール:  
+* **多段ホップSSH**: ゲートサーバー（例: `triton`）に接続し、そこから各ワークステーションと配下ノードへジャンプして安全にシャットダウン。
+* **安全な停止シーケンス**: 各ノードの停止を確認してから親ワークステーションを停止。
+* **YAMLによる設定管理**: 外部YAMLファイルからすべての設定を読み込み可能。
+* **モダンUI機能**:
+
+  * 全体進行度を示す **プログレスバー**
+  * 停止待機中の **スピナー** + ステータスメッセージ
+  * **カラー付きログ**（任意で無効化可）
+  * 実行前にターゲットを一覧表示する **テーブル**
+* **ドライランモード** (`--dry-run`): 実行せずコマンド内容だけを確認。
+* **環境変数でのパスワード指定**。
+* **自動ログ保存**: 実行時の標準出力/標準エラーを `./logs/shutdown_YYYYmmdd_HHMMSS.log` に保存。
+* **単一バイナリ化**: PyInstallerでRichを含めて配布可能。
+
+## インストール
+
+### 必要環境
+
+* Python 3.8以上
+* 必要なパッケージ:
+
   ```bash
-  pip install paramiko cryptography pyyaml
+  pip install paramiko cryptography pyyaml rich
   ```
 
-## セットアップ
 
-1. `config.example.yaml` をコピーして `config.yaml` にリネーム
-2. 実環境に合わせて編集
+## 設定ファイル
 
-   * `gateway`: tritonの接続情報（ホスト名、ユーザー、鍵パス等）
-   * `fleets`: 各workstationの接続情報とノード一覧
+例: `config.yaml`
 
-     * ノードを持たない場合は `nodes: []`
-   * `password`:
+```yaml
+power_off_cmd: "shutdown -h now"
+node_shutdown_timeout: 600
+poll_interval: 5
 
-     * `null` → 実行時プロンプト入力
-     * `"env:VAR"` → 環境変数参照（推奨）
-     * `"文字列"` → 平文（非推奨）
-   * `power_off_cmd` や `node_shutdown_timeout` は環境に合わせ調整可
+gateway:
+  host: triton
+  user: myuser
+  pkey_path: "~/.ssh/id_ed25519"
+  port: 22
+  needs_sudo_password: false
 
-## 実行方法
+fleets:
+  - name: orion
+    user: workstation_user
+    password: "env:ORION_PW"
+    nodes: ["orion01", "orion02", "orion03"]
+    port: 22
+    needs_sudo_password: true
 
-```bash
-# ドライラン（実行しない）
-python shutdown_bot_configured.py --config ./config.yaml --dry-run
-
-# 本番（確認プロンプトあり）
-python shutdown_bot_configured.py --config ./config.yaml
-
-# 設定値を一時上書き
-python shutdown_bot_configured.py -c ./config.yaml --node-timeout 900 --poll-interval 10
-
-# 子ノードが落ち切らなくても親を停止（保護解除）
-python shutdown_bot_configured.py -c ./config.yaml --non-strict
+  - name: spica
+    user: spica_user
+    password: null
+    nodes: []
+    port: 22
+    needs_sudo_password: true
 ```
 
-## バイナリ化
 
-事前にPyInstallerをインストール：
+## 使い方
 
 ```bash
-pip install pyinstaller
+python shutdown_bot_modern.py --config ./config.yaml
 ```
 
-ビルド:
+### オプション
+
+| オプション                | 説明                   |
+| -------------------- | -------------------- |
+| `--dry-run`          | 実際には実行せず、予定のコマンドだけ表示 |
+| `--node-timeout 秒数`  | ノード停止確認のタイムアウトを上書き   |
+| `--poll-interval 秒数` | 到達性チェックの間隔を上書き       |
+| `--non-strict`       | ノード停止未確認でも親を停止する     |
+| `--no-rich`          | Rich UIを無効化（プレーン出力）  |
+| `--no-color-log`     | ログファイルにカラーコードを出力しない  |
+
+
+## 実行例
+
+シャットダウン手順を事前確認:
 
 ```bash
-chmod +x build_binary.sh
+python shutdown_bot_modern.py -c config.yaml --dry-run
+```
+
+Rich UI付きで実行:
+
+```bash
+python shutdown_bot_modern.py -c config.yaml
+```
+
+プレーン出力モード:
+
+```bash
+python shutdown_bot_modern.py -c config.yaml --no-rich
+```
+
+
+## 単一バイナリ化
+
+実行例：
+
+```bash
+pyinstaller --onefile \
+  --name shutdown-bot \
+  --collect-all paramiko \
+  --collect-all cryptography \
+  --collect-all rich \
+  shutdown_bot_modern.py
+```
+
+生成されたバイナリは `dist/shutdown-bot` に出力されます。
+
+
+## スクリプトを使用してバイナリ化する場合
+
+#### 1. Modern版（`shutdown_bot_modern.py`）をバイナリ化する場合
+
+```bash
+./build_binary.sh
+```
+
+* 引数を省略すると、スクリプト内のデフォルト（`shutdown_bot_modern.py`）をビルドします。
+* 成功すると `dist/shutdown-bot` が生成されます。
+
+#### 2. 別のスクリプトを指定してビルドする場合
+
+```bash
 ./build_binary.sh shutdown_bot_configured.py
 ```
 
-生成物:
+* 引数にファイル名を渡せば、そのスクリプトをビルドします。
 
-```
-dist/shutdown-bot
-```
+### 注意事項
 
-実行例:
+* 実行前に必要なパッケージをインストールしてください：
 
-```bash
-./dist/shutdown-bot --config ./config.yaml
-```
+  ```bash
+  pip install pyinstaller paramiko cryptography pyyaml rich
+  ```
+* macOS / Linuxではスクリプトに実行権限が必要です：
 
-## ログ
-
-* 実行ごとに `./logs/shutdown_YYYYmmdd_HHMMSS.log` を作成
-* 画面に出た標準出力・標準エラーは全てログにも記録されます
-
-## 注意
-
-* 親サーバー停止後は配下ノードにアクセスできなくなります
-* 必ず **ノード → 親 → 最後にtriton** の順で停止されます
-* 本番前に `--dry-run` や限定的なテストで動作確認してください
+  ```bash
+  chmod +x build_binary.sh
+  ```
+* 出力されたバイナリは、依存ライブラリを含む**単一実行ファイル**です。
