@@ -1,5 +1,6 @@
 build/
 dist/
+logs/
 venv/
 *.spec
 .DS_Store
