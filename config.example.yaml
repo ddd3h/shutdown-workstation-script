@@ -1,7 +1,7 @@
 # shutdown-bot 設定 (YAML)
 
 # 停止コマンド（環境に合わせて変更可）
-power_off_cmd: "shutdown -h now"   # 例: "systemctl poweroff" でも可
+power_off_cmd: "shutdown -p now"   # 例: "systemctl poweroff" でも可
 
 # ノード停止確認の待機設定
 node_shutdown_timeout: 600   # 秒

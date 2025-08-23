@@ -11,6 +11,9 @@ SSH Shutdown Bot (modern UI + diagnostics + configurable timeouts)
 - 到達不能時はそのホップ上で DNS/TCP 診断を実施し、原因を分類して提示
 - タイムアウト（SSH接続/チャネル/診断など）は config.yaml の timeouts セクションから設定可能
 - ログは ./logs/shutdown_YYYYmmdd_HHMMSS.log に保存（stdout/stderr を Tee）
+- 完了確認
+    * 親(workstation)の停止完了を gateway(triton) から到達性で確認
+    * 子/親のいずれかが未停止なら、--non-strict が無い限り triton 停止をスキップ
 """
 
 # ---- ログ保存 ----
@@ -387,7 +390,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="停止コマンドは実行しない（接続は行う）")
     ap.add_argument("--node-timeout", type=int, default=None, help="各ノードの停止待ちタイムアウト(秒)（設定の上書き）")
     ap.add_argument("--poll-interval", type=int, default=None, help="到達性チェックの間隔(秒)（設定の上書き）")
-    ap.add_argument("--non-strict", action="store_true", help="ノードの完全停止が確認できなくても親を停止する")
+    ap.add_argument("--non-strict", action="store_true", help="ノード/親の完全停止が確認できなくても上位を停止する（triton含む）")
     ap.add_argument("--no-rich", action="store_true", help="Rich UI を無効化（プレーン出力）")
     ap.add_argument("--no-color-log", action="store_true", help="ログファイルにカラーコードを出さない")
     args = ap.parse_args()
@@ -467,6 +470,7 @@ def main():
             progress_ctx.update(task_id, advance=n)
 
     issues: List[Dict[str, Any]] = []
+    any_incomplete = False  # ← 追加: 子/親の停止未完了が一つでもあれば True
 
     try:
         if progress_ctx: progress_ctx.start()
@@ -487,6 +491,7 @@ def main():
                 issues.append(issue)
                 (console.log(f"[red]WS接続失敗[/red]: {reason}") if console else print(f"WS接続失敗: {reason}"))
                 # workstationに入れないので子はスキップ
+                any_incomplete = True  # 親へ到達不可＝未停止と同等の扱いにする
                 step_advance(len(f.nodes) + 1)
                 continue
             if console: console.log(f"[green]Connected[/green]: {f.name} OK")
@@ -515,6 +520,7 @@ def main():
                         (console.log(f"[red]Node接続失敗[/red]: {node} — {reason}: {hint}") if console else print(f"[エラー] {node} 接続失敗: {reason} — {hint} — {e}"))
                         if not args.dry_run and not args.non_strict:
                             parent_skip = True
+                        any_incomplete = True
                         step_advance(1)
                         continue
                     try:
@@ -530,40 +536,66 @@ def main():
                                                                   timeout_sec=node_timeout,
                                                                   poll_interval=poll_interval,
                                                                   console=console)
-                            if not ok and not args.non_strict:
-                                msg = f"[保護] {node} の完全停止が確認できないため、{f.name} の停止をスキップします。--non-strict 指定で無視可。"
-                                (console.log(f"[yellow]{msg}[/yellow]") if console else print(msg))
-                                parent_skip = True
+                            if not ok:
+                                if not args.non_strict:
+                                    msg = f"[保護] {node} の完全停止が確認できないため、{f.name} の停止をスキップします。--non-strict 指定で無視可。"
+                                    (console.log(f"[yellow]{msg}[/yellow]") if console else print(msg))
+                                    parent_skip = True
+                                any_incomplete = True
                         step_advance(1)
                         time.sleep(0.2)
 
-                # 親停止
+                # 親停止（停止完了の確認を追加）
                 if parent_skip:
                     (console.log(f"[yellow][保護] {f.name} の停止はスキップされました（子ノード未停止の可能性）。[/yellow]") if console else print(f"[保護] {f.name} の停止はスキップされました（子ノード未停止の可能性）。"))
+                    any_incomplete = True
                 else:
                     shutdown_host(f.name, ws.client,
                                   needs_sudo_password=f.needs_sudo_password,
                                   sudo_password=pw,
                                   dry_run=args.dry_run,
                                   console=console)
+                    # 親の停止完了を gateway から確認
+                    if not args.dry_run:
+                        ok_parent = wait_for_host_down_via_transport(
+                            gw_conn.transport, f.name, f.port,
+                            timeout_sec=node_timeout,
+                            poll_interval=poll_interval,
+                            console=console
+                        )
+                        if not ok_parent:
+                            if not args.non_strict:
+                                msg = f"[保護] {f.name} の完全停止が確認できないため、triton の停止条件を満たしません。--non-strict で無視可。"
+                                (console.log(f"[yellow]{msg}[/yellow]") if console else print(msg))
+                            any_incomplete = True
                 step_advance(1)
             finally:
+                # 親が落ちているとここで切断例外が出る可能性があるが close() は例外を握り潰す
                 ws.close()
                 time.sleep(0.2)
 
-        # triton停止
-        if console: console.log("[bold]Shutting down triton…[/bold]")
-        else: print("\n[3] triton を停止…")
-        shutdown_host("triton", gw_conn.client,
-                      needs_sudo_password=gw.needs_sudo_password,
-                      sudo_password=gw_sudo_pw,
-                      dry_run=args.dry_run,
-                      console=console)
-        step_advance(1)
+        # triton停止（ガード追加）
+        if console: console.log("[bold]Evaluating whether to shut down triton…[/bold]")
+        else: print("\n[3] triton 停止の可否を評価…")
+        if any_incomplete and not args.non_strict:
+            msg = "[保護] 子/親の停止未完了があるため triton の停止をスキップします。--non-strict で無視可。"
+            (console.log(f"[yellow]{msg}[/yellow]") if console else print(msg))
+        else:
+            if console: console.log("[bold]Shutting down triton…[/bold]")
+            else: print("\n[3] triton を停止…")
+            shutdown_host("triton", gw_conn.client,
+                          needs_sudo_password=gw.needs_sudo_password,
+                          sudo_password=gw_sudo_pw,
+                          dry_run=args.dry_run,
+                          console=console)
+            step_advance(1)
 
     finally:
         if progress_ctx: progress_ctx.stop()
-        gw_conn.close()
+        try:
+            gw_conn.close()
+        except Exception:
+            pass
         # 診断レポート
         if issues:
             if console:
